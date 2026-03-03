@@ -1,0 +1,11 @@
+# EAI日志监听服务依赖包
+# Python 3.8+
+
+# SSH连接
+paramiko>=3.0.0
+
+# Oracle数据库连接
+cx_Oracle>=8.3.0
+
+# 可选：用于更好的日志格式化
+colorlog>=6.7.0
