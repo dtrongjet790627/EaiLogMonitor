@@ -72,7 +72,7 @@ class FixedLogParser:
     SUCCESS_PATTERN = re.compile(r'"IsSuccess"\s*:\s*true', re.IGNORECASE)
 
     def __init__(self):
-        self._current_trigger = None
+        self._trigger_queues: Dict[str, list] = {}  # {WONO: [trigger, ...]}
         self._current_timestamp = None
 
     def parse_line(self, line: str) -> Optional[ReportRecord]:
@@ -110,28 +110,36 @@ class FixedLogParser:
         try:
             data_list = json.loads(json_str)
             if data_list and isinstance(data_list, list):
-                self._current_trigger = data_list[0]
-                logger.debug(f"缓存触发器: {self._current_trigger.get('WONO')}")
+                trigger = data_list[0]
+                wono = trigger.get('WONO', '')
+                if not wono:
+                    return
+                if wono not in self._trigger_queues:
+                    self._trigger_queues[wono] = []
+                self._trigger_queues[wono].append(trigger)
+                logger.debug(f"入队触发器: WONO={wono}, PACKID={trigger.get('PACKID')}, 队列深度={len(self._trigger_queues[wono])}")
         except:
             pass
 
     def _handle_response(self, json_str: str) -> Optional[ReportRecord]:
         """处理响应"""
-        if not self._current_trigger:
+        if not self._trigger_queues:
             return None
 
         if not self.SUCCESS_PATTERN.search(json_str):
-            self._current_trigger = None
             return None
 
         try:
             resp_data = json.loads(json_str)
             schb_number = self._extract_schb(resp_data)
             if not schb_number:
-                self._current_trigger = None
                 return None
 
-            trigger = self._current_trigger
+            # 按整体入队顺序取最早的 trigger（FIFO）
+            trigger = self._pop_oldest_trigger()
+            if not trigger:
+                return None
+
             record = ReportRecord(
                 schb_number=schb_number,
                 source_bill_no=trigger.get('WONO', ''),
@@ -143,14 +151,22 @@ class FixedLogParser:
                 is_success=True
             )
 
-            self._current_trigger = None
             logger.info(f"解析成功: SCHB={schb_number}, WONO={record.source_bill_no}, TIME={record.report_time}")
             return record
 
         except Exception as e:
             logger.debug(f"解析响应失败: {e}")
-            self._current_trigger = None
             return None
+
+    def _pop_oldest_trigger(self) -> Optional[dict]:
+        """按 FIFO 取出最早入队的 trigger"""
+        for wono, queue in list(self._trigger_queues.items()):
+            if queue:
+                trigger = queue.pop(0)
+                if not queue:
+                    del self._trigger_queues[wono]
+                return trigger
+        return None
 
     def _extract_schb(self, data: dict) -> Optional[str]:
         """提取汇报单号"""

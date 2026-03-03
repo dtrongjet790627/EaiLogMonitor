@@ -126,8 +126,8 @@ class LogParser:
 
     def __init__(self):
         """初始化解析器"""
-        # 当前触发器数据（从db trigger get data中提取）
-        self._current_trigger: Optional[TriggerData] = None
+        # 触发器队列字典（以 WONO 为 key，支持并发多工单）
+        self._trigger_queues: Dict[str, list] = {}  # {WONO: [TriggerData, ...]}
 
         # 当前待配对的请求（只保留一个，确保精确配对）
         # (时间, 数据, 源单号, 产线)
@@ -161,12 +161,15 @@ class LogParser:
                 raw_data=json_str
             )
 
-            # 覆盖之前的触发器数据
-            if self._current_trigger:
-                logger.debug(f"覆盖未使用的触发器数据: {self._current_trigger.wono}")
-
-            self._current_trigger = trigger
-            logger.info(f"缓存触发器数据: LINE={trigger.line}, WONO={trigger.wono}, PACKID={trigger.pack_id}")
+            # 入队触发器数据（支持同一 WONO 并发多次触发）
+            wono = trigger.wono
+            if not wono:
+                logger.warning(f"触发器数据缺少 WONO 字段，丢弃: {json_str[:100]}")
+                return
+            if wono not in self._trigger_queues:
+                self._trigger_queues[wono] = []
+            self._trigger_queues[wono].append(trigger)
+            logger.info(f"入队触发器数据: LINE={trigger.line}, WONO={wono}, PACKID={trigger.pack_id}, 队列深度={len(self._trigger_queues[wono])}")
 
         except json.JSONDecodeError as e:
             logger.warning(f"触发器JSON解析失败: {e}, 内容: {json_str[:100]}")
@@ -272,21 +275,22 @@ class LogParser:
             data, source_bill_no = self._extract_from_truncated_json(json_str)
 
             if not data:
-                # 正则提取也失败，尝试使用触发器数据
-                if self._current_trigger:
-                    logger.info(f"使用触发器数据填充请求: WONO={self._current_trigger.wono}")
+                # 正则提取也失败，尝试使用触发器队列中最早的触发器数据
+                fallback_trigger = self._pop_oldest_trigger_any()
+                if fallback_trigger:
+                    logger.info(f"使用触发器数据填充请求: WONO={fallback_trigger.wono}")
                     data = {
                         '_from_trigger': True,
                         '_raw_request': json_str,
                         '_parsed_data': {
-                            'FMoBillNo': self._current_trigger.wono,
-                            'FFinishQty': float(self._current_trigger.cnt) if self._current_trigger.cnt else 0,
-                            'FQuaQty': float(self._current_trigger.cnt) if self._current_trigger.cnt else 0,
-                            'FMaterialId': {'FNumber': self._current_trigger.part_no},
-                            'FLot': {'FNumber': self._current_trigger.pack_id},
+                            'FMoBillNo': fallback_trigger.wono,
+                            'FFinishQty': float(fallback_trigger.cnt) if fallback_trigger.cnt else 0,
+                            'FQuaQty': float(fallback_trigger.cnt) if fallback_trigger.cnt else 0,
+                            'FMaterialId': {'FNumber': fallback_trigger.part_no},
+                            'FLot': {'FNumber': fallback_trigger.pack_id},
                         }
                     }
-                    source_bill_no = self._current_trigger.wono
+                    source_bill_no = fallback_trigger.wono
                 else:
                     logger.warning(f"无法从截断JSON提取数据且无触发器数据")
                     return
@@ -295,15 +299,21 @@ class LogParser:
             logger.warning(f"处理请求失败: {e}")
             return
 
-        # 从触发器数据获取产线和源单号（如果缺失）
+        # 从触发器队列中精确匹配 source_bill_no 对应的触发器，获取产线信息
         line_name = ''
-        if self._current_trigger:
-            line_name = self._current_trigger.line
-            # 如果source_bill_no为空，使用触发器数据的WONO
-            if not source_bill_no:
-                source_bill_no = self._current_trigger.wono
-                logger.info(f"使用触发器数据填充源单号: {source_bill_no}")
+        matched_trigger = self._pop_trigger_for_wono(source_bill_no) if source_bill_no else None
+        if matched_trigger:
+            line_name = matched_trigger.line
             logger.debug(f"使用触发器中的产线: {line_name}")
+        elif self._trigger_queues:
+            # 有其他触发器但未匹配到 source_bill_no，取最早的作为兜底
+            fallback = self._pop_oldest_trigger_any()
+            if fallback:
+                line_name = fallback.line
+                if not source_bill_no:
+                    source_bill_no = fallback.wono
+                    logger.info(f"使用触发器数据填充源单号: {source_bill_no}")
+                logger.debug(f"兜底触发器产线: {line_name}")
         else:
             logger.warning(f"请求 {source_bill_no} 没有对应的触发器数据，产线将为空")
 
@@ -393,40 +403,43 @@ class LogParser:
             # 检查是否有待配对的请求
             use_trigger_fallback = False
             if not self._current_request:
-                # 没有请求，但有触发器数据时，使用触发器数据直接配对
-                if self._current_trigger:
-                    logger.info(f"请求被截断，使用触发器数据直接配对: WONO={self._current_trigger.wono}, LINE={self._current_trigger.line}")
+                # 没有请求，但有触发器队列时，使用最早的触发器数据直接配对
+                fallback_trigger = self._pop_oldest_trigger_any()
+                if fallback_trigger:
+                    logger.info(f"请求被截断，使用触发器数据直接配对: WONO={fallback_trigger.wono}, LINE={fallback_trigger.line}")
                     use_trigger_fallback = True
                     # 从触发器构造基本请求数据
                     req_data = {
                         '_from_trigger': True,
-                        'WONO': self._current_trigger.wono,
-                        'LINE': self._current_trigger.line,
-                        'PACKID': self._current_trigger.pack_id,
-                        'CNT': self._current_trigger.cnt,
-                        'PARTNO': self._current_trigger.part_no,
+                        'WONO': fallback_trigger.wono,
+                        'LINE': fallback_trigger.line,
+                        'PACKID': fallback_trigger.pack_id,
+                        'CNT': fallback_trigger.cnt,
+                        'PARTNO': fallback_trigger.part_no,
                         '_parsed_data': {
-                            'FMoBillNo': self._current_trigger.wono,
-                            'FFinishQty': float(self._current_trigger.cnt) if self._current_trigger.cnt else 0,
-                            'FQuaQty': float(self._current_trigger.cnt) if self._current_trigger.cnt else 0,
-                            'FMaterialId': {'FNumber': self._current_trigger.part_no},
-                            'FLot': {'FNumber': self._current_trigger.pack_id},
+                            'FMoBillNo': fallback_trigger.wono,
+                            'FFinishQty': float(fallback_trigger.cnt) if fallback_trigger.cnt else 0,
+                            'FQuaQty': float(fallback_trigger.cnt) if fallback_trigger.cnt else 0,
+                            'FMaterialId': {'FNumber': fallback_trigger.part_no},
+                            'FLot': {'FNumber': fallback_trigger.pack_id},
                         }
                     }
-                    source_bill_no = self._current_trigger.wono
-                    line_name = self._current_trigger.line
+                    source_bill_no = fallback_trigger.wono
+                    line_name = fallback_trigger.line
                 else:
                     logger.warning("收到响应但没有待配对的请求且无触发器数据，跳过")
                     return None
             else:
                 # 取出当前请求进行配对
                 req_timestamp, req_data, source_bill_no, line_name = self._current_request
-                if not line_name and self._current_trigger:
-                    line_name = self._current_trigger.line
-                    logger.info(f"补充 LINE（请求时触发器未就绪）: {line_name}")
+                if not line_name:
+                    # 请求时产线为空，尝试从队列精确匹配
+                    late_trigger = self._pop_trigger_for_wono(source_bill_no) if source_bill_no else None
+                    if late_trigger:
+                        line_name = late_trigger.line
+                        logger.info(f"补充 LINE（请求时触发器未就绪）: {line_name}")
 
             self._current_request = None  # 清空，确保不会重复配对
-            self._current_trigger = None  # 清空触发器数据，本次流程完成
 
             # 判断是成功还是失败
             is_success = self.SUCCESS_PATTERN.search(json_str) is not None
@@ -471,6 +484,26 @@ class LogParser:
         except Exception as e:
             logger.warning(f"处理响应失败: {e}")
             return None
+
+    def _pop_trigger_for_wono(self, wono: str) -> Optional[TriggerData]:
+        """从队列中取出指定 WONO 最早入队的 trigger（精确匹配，FIFO）"""
+        queue = self._trigger_queues.get(wono)
+        if queue:
+            trigger = queue.pop(0)
+            if not queue:
+                del self._trigger_queues[wono]
+            return trigger
+        return None
+
+    def _pop_oldest_trigger_any(self) -> Optional[TriggerData]:
+        """从所有队列中取出整体最早入队的 trigger（FIFO，用于兜底场景）"""
+        for wono, queue in list(self._trigger_queues.items()):
+            if queue:
+                trigger = queue.pop(0)
+                if not queue:
+                    del self._trigger_queues[wono]
+                return trigger
+        return None
 
     def _extract_source_bill_no(self, data: dict) -> Optional[str]:
         """
@@ -795,11 +828,14 @@ class LogParser:
                 if wono_match:
                     source_bill_no = wono_match.group(1)
 
-            # 如果还没有获取到产线，尝试从触发器数据获取
-            if not line_name and self._current_trigger:
-                line_name = self._current_trigger.line
-                if not source_bill_no:
-                    source_bill_no = self._current_trigger.wono
+            # 如果还没有获取到产线，尝试从触发器队列获取（精确匹配或兜底）
+            if not line_name:
+                lua_trigger = (self._pop_trigger_for_wono(source_bill_no) if source_bill_no
+                               else self._pop_oldest_trigger_any())
+                if lua_trigger:
+                    line_name = lua_trigger.line
+                    if not source_bill_no:
+                        source_bill_no = lua_trigger.wono
 
             # 清理错误信息
             if error_message:
@@ -812,9 +848,8 @@ class LogParser:
             else:
                 error_message = 'Lua执行错误'
 
-            # 清空当前状态
+            # 清空当前请求状态（触发器队列已在取出时清理）
             self._current_request = None
-            self._current_trigger = None
 
             logger.info(f"解析到Lua错误记录: 源单号={source_bill_no}, 产线={line_name}, 错误={error_message[:100]}")
 
