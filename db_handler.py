@@ -74,6 +74,7 @@ class DBHandler:
         self._pool = None
         self._lock = threading.Lock()
         self._inserted_schb_numbers: Set[str] = set()  # 内存缓存已插入的工单号
+        self._createtime_col = 'CREATETIME'  # 动态列名，兼容新旧表结构
 
     def connect(self):
         """建立数据库连接池"""
@@ -183,12 +184,22 @@ class DBHandler:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 # BUG-013 修复：只加载最近90天的记录，避免全量加载导致内存占用过高
-                cursor.execute(f"SELECT SCHB_NUMBER FROM {self.TABLE_NAME} WHERE CREATE_TIME >= SYSDATE - 90")
+                # 兼容新旧表结构：先尝试 CREATETIME（旧表），再尝试 CREATE_TIME（新DDL）
+                for col in ('CREATETIME', 'CREATE_TIME'):
+                    try:
+                        cursor.execute(f"SELECT SCHB_NUMBER FROM {self.TABLE_NAME} WHERE {col} >= SYSDATE - 90")
+                        self._createtime_col = col
+                        break
+                    except cx_Oracle.Error:
+                        continue
+                else:
+                    # 两个列名都不存在，全量加载
+                    cursor.execute(f"SELECT SCHB_NUMBER FROM {self.TABLE_NAME}")
 
                 with self._lock:
                     self._inserted_schb_numbers = {row[0] for row in cursor.fetchall()}
 
-                logger.info(f"已加载 {len(self._inserted_schb_numbers)} 个已存在的工单号")
+                logger.info(f"已加载 {len(self._inserted_schb_numbers)} 个已存在的工单号（使用列 {self._createtime_col}）")
 
         except cx_Oracle.Error as e:
             logger.warning(f"加载已存在工单号失败: {e}")
@@ -431,11 +442,12 @@ class DBHandler:
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
-                # 使用实际表结构的列名（BUG-015 修复：统一使用 CREATE_TIME，与 DDL 和 INSERT 保持一致）
+                # 使用动态列名兼容新旧表结构（CREATETIME 旧表 / CREATE_TIME 新DDL）
+                col = self._createtime_col
                 cursor.execute(f"""
-                    SELECT SCHB_NUMBER, CNT, PARTNO, REPORT_TIME, CREATE_TIME
+                    SELECT SCHB_NUMBER, CNT, PARTNO, REPORT_TIME, {col}
                     FROM {self.TABLE_NAME}
-                    ORDER BY CREATE_TIME DESC
+                    ORDER BY {col} DESC
                     FETCH FIRST :limit ROWS ONLY
                 """, {'limit': limit})
 
