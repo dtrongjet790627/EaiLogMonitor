@@ -115,13 +115,22 @@ class SSHLogMonitor:
                     time.sleep(SERVICE_CONFIG['reconnect_interval'])
                     continue
 
+                # BUG-016 修复：重连后先补读最近1000行，避免断开期间日志丢失
+                catchup_command = f'tail -1000 "{self.full_path}"'
+                logger.info(f"补读历史日志: {catchup_command}")
+                _, catchup_stdout, _ = self._ssh_client.exec_command(catchup_command)
+                catchup_data = catchup_stdout.read().decode('utf-8', errors='ignore')
+                for catchup_line in catchup_data.splitlines():
+                    self._process_line(catchup_line)
+                logger.info(f"补读历史日志完成，共 {len(catchup_data.splitlines())} 行")
+
                 # 执行tail -F命令（路径需要引号包裹，因为包含空格）
                 command = f'tail -F "{self.full_path}"'
                 logger.info(f"执行命令: {command}")
 
+                # BUG-017 修复：去掉 get_pty=True，避免 stderr 混入 stdout
                 stdin, stdout, stderr = self._ssh_client.exec_command(
-                    command,
-                    get_pty=True
+                    command
                 )
 
                 # 持续读取输出
@@ -131,7 +140,8 @@ class SSHLogMonitor:
                 while self._running and not self._channel.closed:
                     if self._channel.recv_ready():
                         try:
-                            data = self._channel.recv(4096).decode('utf-8', errors='ignore')
+                            # BUG-018 修复：缓冲区从 4096 扩大到 65536（64KB），减少高频日志积压
+                            data = self._channel.recv(65536).decode('utf-8', errors='ignore')
                             buffer += data
 
                             # 按行处理
@@ -260,10 +270,10 @@ class EAILogMonitorService:
                                 inserted = handler.insert_records_batch(records)
                                 self._stats['inserted_records'] += inserted
                                 self._stats['duplicate_records'] += len(records) - inserted
+                                batch_records[schema] = []  # 只有成功才清空
                             except Exception as e:
                                 logger.error(f"插入数据库失败 ({schema}): {e}")
-
-                            batch_records[schema] = []
+                                # 不清空，下次循环继续重试
 
                     last_insert_time = current_time
 

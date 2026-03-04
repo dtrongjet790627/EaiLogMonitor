@@ -182,7 +182,8 @@ class DBHandler:
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute(f"SELECT SCHB_NUMBER FROM {self.TABLE_NAME}")
+                # BUG-013 修复：只加载最近90天的记录，避免全量加载导致内存占用过高
+                cursor.execute(f"SELECT SCHB_NUMBER FROM {self.TABLE_NAME} WHERE CREATE_TIME >= SYSDATE - 90")
 
                 with self._lock:
                     self._inserted_schb_numbers = {row[0] for row in cursor.fetchall()}
@@ -391,15 +392,19 @@ class DBHandler:
 
                         if cursor.rowcount > 0:
                             success_count += 1
-                            # 仅成功记录加入缓存
-                            if record.is_success:
-                                with self._lock:
-                                    self._inserted_schb_numbers.add(record.schb_number)
 
                     except cx_Oracle.Error as e:
                         logger.warning(f"批量插入单条失败: {e}, 工单号: {record.schb_number}")
 
                 conn.commit()
+
+                # BUG-012 修复：commit 成功后才更新内存缓存，避免 commit 失败时缓存误标已插入
+                newly_inserted = [
+                    r.schb_number for r in new_records
+                    if r.is_success and r.schb_number not in self._inserted_schb_numbers
+                ]
+                with self._lock:
+                    self._inserted_schb_numbers.update(newly_inserted)
 
         except cx_Oracle.Error as e:
             logger.error(f"批量插入失败: {e}")
@@ -426,11 +431,11 @@ class DBHandler:
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
-                # 使用实际表结构的列名
+                # 使用实际表结构的列名（BUG-015 修复：统一使用 CREATE_TIME，与 DDL 和 INSERT 保持一致）
                 cursor.execute(f"""
-                    SELECT SCHB_NUMBER, CNT, PARTNO, REPORT_TIME, CREATETIME
+                    SELECT SCHB_NUMBER, CNT, PARTNO, REPORT_TIME, CREATE_TIME
                     FROM {self.TABLE_NAME}
-                    ORDER BY CREATETIME DESC
+                    ORDER BY CREATE_TIME DESC
                     FETCH FIRST :limit ROWS ONLY
                 """, {'limit': limit})
 

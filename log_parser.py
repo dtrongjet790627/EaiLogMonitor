@@ -67,8 +67,9 @@ class LogParser:
     )
 
     # 触发器数据标识 - 匹配 db trigger get data:[{...}]
+    # BUG-005 修复：使用贪婪匹配 .* 避免嵌套数组（如 ITEMS:[1,2]）在第一个 ] 处截断
     TRIGGER_DATA_PATTERN = re.compile(
-        r'db\s+trigger\s+get\s+data:\s*(\[.*?\])',
+        r'db\s+trigger\s+get\s+data:\s*(\[.*\])',
         re.IGNORECASE | re.DOTALL
     )
 
@@ -275,7 +276,8 @@ class LogParser:
             data, source_bill_no = self._extract_from_truncated_json(json_str)
 
             if not data:
-                # 正则提取也失败，尝试使用触发器队列中最早的触发器数据
+                # BUG-001 修复：正则提取也失败时，从 fallback_trigger 一次性获取所有字段，
+                # 不再进行后续的二次 trigger 查找，避免再 pop 出不同的 trigger 导致数据混乱
                 fallback_trigger = self._pop_oldest_trigger_any()
                 if fallback_trigger:
                     logger.info(f"使用触发器数据填充请求: WONO={fallback_trigger.wono}")
@@ -291,6 +293,11 @@ class LogParser:
                         }
                     }
                     source_bill_no = fallback_trigger.wono
+                    # 直接使用 fallback_trigger 中的产线，跳过后续精确匹配逻辑
+                    line_name = fallback_trigger.line
+                    self._current_request = (timestamp, data, source_bill_no, line_name)
+                    logger.debug(f"记录当前请求(截断兜底): {source_bill_no}, 产线: {line_name}")
+                    return
                 else:
                     logger.warning(f"无法从截断JSON提取数据且无触发器数据")
                     return
@@ -459,7 +466,16 @@ class LogParser:
                         logger.info(f"解析到报工成功记录: 汇报单号={record.schb_number}, 源单号={record.source_bill_no}, 产线={record.line}")
                         return record
                 except json.JSONDecodeError as e:
-                    logger.warning(f"成功响应JSON解析失败: {e}")
+                    # BUG-004 修复：JSON 解析失败时尝试用正则从截断 JSON 中提取 schb_number，
+                    # 提取不到才放弃，并记录完整上下文便于人工核查
+                    schb_number = self._extract_schb_from_truncated(json_str)
+                    if schb_number:
+                        logger.info(f"成功响应JSON截断，正则提取汇报单号: {schb_number}")
+                        record = self._build_record(req_data, {}, json_str, schb_number, source_bill_no, line_name)
+                        if record:
+                            logger.info(f"解析到报工成功记录(截断): 汇报单号={record.schb_number}, 源单号={record.source_bill_no}, 产线={record.line}")
+                            return record
+                    logger.warning(f"成功响应JSON解析失败且无法提取汇报单号: {e}, JSON前200字符: {json_str[:200]}")
                     return None
 
             elif is_failure:
@@ -478,7 +494,8 @@ class LogParser:
                 return record
 
             else:
-                logger.debug(f"响应状态不明确，跳过: {json_str[:100]}")
+                # BUG-007 修复：状态不明确时改为 warning 级别，并记录 json_str 前200字符便于排查
+                logger.warning(f"响应状态不明确（无 IsSuccess 字段），跳过: {json_str[:200]}")
                 return None
 
         except Exception as e:
@@ -601,6 +618,31 @@ class LogParser:
                     return str(result[key])
 
         return self._recursive_search(data, possible_keys)
+
+    def _extract_schb_from_truncated(self, json_str: str) -> Optional[str]:
+        """
+        BUG-004 辅助方法：从截断的成功响应 JSON 中用正则提取汇报单号
+
+        尝试提取 Number / FBillNo / BillNo / SCHB_NUMBER 字段值
+
+        Args:
+            json_str: 截断的响应 JSON 字符串
+
+        Returns:
+            汇报单号，提取失败返回 None
+        """
+        # 按优先级依次尝试提取
+        patterns = [
+            re.compile(r'"Number"\s*:\s*"([^"]+)"', re.IGNORECASE),
+            re.compile(r'"FBillNo"\s*:\s*"([^"]+)"', re.IGNORECASE),
+            re.compile(r'"BillNo"\s*:\s*"([^"]+)"', re.IGNORECASE),
+            re.compile(r'"SCHB_NUMBER"\s*:\s*"([^"]+)"', re.IGNORECASE),
+        ]
+        for pat in patterns:
+            m = pat.search(json_str)
+            if m:
+                return m.group(1)
+        return None
 
     def _build_record(self, req_data: dict, resp_data: dict, raw_response: str,
                        schb_number: str, source_bill_no: str, line_name: str = '') -> Optional[ReportRecord]:
@@ -848,8 +890,9 @@ class LogParser:
             else:
                 error_message = 'Lua执行错误'
 
-            # 清空当前请求状态（触发器队列已在取出时清理）
-            self._current_request = None
+            # BUG-011 修复：清空前确认 WONO 匹配，避免清掉不相关工单的配对状态
+            if self._current_request and self._current_request[2] == source_bill_no:
+                self._current_request = None
 
             logger.info(f"解析到Lua错误记录: 源单号={source_bill_no}, 产线={line_name}, 错误={error_message[:100]}")
 

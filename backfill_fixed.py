@@ -55,12 +55,14 @@ class ReportRecord:
 class FixedLogParser:
     """修正版日志解析器 - 确保使用日志时间戳"""
 
+    # BUG-021 修复：改为匹配任意日志级别 \[\w+\]，而非硬编码 \[INFO\]
     LOG_TIMESTAMP_PATTERN = re.compile(
-        r'\[INFO\]\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\.\d+\]'
+        r'\[\w+\]\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\.\d+\]'
     )
 
+    # BUG-005 修复（同 log_parser.py）：贪婪匹配避免嵌套数组截断
     TRIGGER_DATA_PATTERN = re.compile(
-        r'db\s+trigger\s+get\s+data:\s*(\[.*?\])',
+        r'db\s+trigger\s+get\s+data:\s*(\[.*\])',
         re.IGNORECASE | re.DOTALL
     )
 
@@ -69,11 +71,19 @@ class FixedLogParser:
         re.IGNORECASE | re.DOTALL
     )
 
+    # BUG-020 新增：用于识别 request 行，从而缓存当前 WONO 实现精确配对
+    KINGDEE_REQUEST_PATTERN = re.compile(
+        r'kingdee\s+request\s+json\s*:\s*(\{.*)',
+        re.IGNORECASE | re.DOTALL
+    )
+
     SUCCESS_PATTERN = re.compile(r'"IsSuccess"\s*:\s*true', re.IGNORECASE)
 
     def __init__(self):
         self._trigger_queues: Dict[str, list] = {}  # {WONO: [trigger, ...]}
         self._current_timestamp = None
+        # BUG-020 新增：缓存当前 request 行解析出的 WONO，用于精确匹配 trigger 队列
+        self._current_wono: Optional[str] = None
 
     def parse_line(self, line: str) -> Optional[ReportRecord]:
         """解析单行日志"""
@@ -94,6 +104,19 @@ class FixedLogParser:
             trigger_match = self.TRIGGER_DATA_PATTERN.search(line)
             if trigger_match:
                 self._handle_trigger(trigger_match.group(1))
+                return None
+
+            # BUG-020 新增：检查 request 行，缓存 WONO 用于后续精确配对
+            req_match = self.KINGDEE_REQUEST_PATTERN.search(line)
+            if req_match:
+                try:
+                    req_data = json.loads(req_match.group(1))
+                    wono = self._extract_wono_from_request(req_data)
+                    if wono:
+                        self._current_wono = wono
+                        logger.debug(f"缓存 request WONO: {wono}")
+                except Exception:
+                    pass
                 return None
 
             # 检查响应
@@ -124,19 +147,35 @@ class FixedLogParser:
     def _handle_response(self, json_str: str) -> Optional[ReportRecord]:
         """处理响应"""
         if not self._trigger_queues:
+            self._current_wono = None
             return None
 
         if not self.SUCCESS_PATTERN.search(json_str):
+            self._current_wono = None
             return None
 
         try:
             resp_data = json.loads(json_str)
             schb_number = self._extract_schb(resp_data)
             if not schb_number:
+                self._current_wono = None
                 return None
 
-            # 按整体入队顺序取最早的 trigger（FIFO）
-            trigger = self._pop_oldest_trigger()
+            # BUG-020 修复：优先用 _current_wono 精确匹配 trigger 队列，无法精确匹配时再 FIFO 兜底
+            trigger = None
+            if self._current_wono and self._current_wono in self._trigger_queues:
+                queue = self._trigger_queues[self._current_wono]
+                if queue:
+                    trigger = queue.pop(0)
+                    if not queue:
+                        del self._trigger_queues[self._current_wono]
+                    logger.debug(f"精确匹配 trigger: WONO={self._current_wono}")
+            if not trigger:
+                trigger = self._pop_oldest_trigger()  # 兜底：FIFO
+                if trigger:
+                    logger.debug(f"兜底 FIFO 取 trigger: WONO={trigger.get('WONO', '')}")
+            self._current_wono = None  # 消费完毕，清空
+
             if not trigger:
                 return None
 
@@ -155,6 +194,7 @@ class FixedLogParser:
             return record
 
         except Exception as e:
+            self._current_wono = None
             logger.debug(f"解析响应失败: {e}")
             return None
 
@@ -166,6 +206,51 @@ class FixedLogParser:
                 if not queue:
                     del self._trigger_queues[wono]
                 return trigger
+        return None
+
+    def _extract_wono_from_request(self, data: dict) -> Optional[str]:
+        """
+        BUG-020 辅助方法：从 request JSON 中提取 WONO/FBillNo 字段
+
+        参考 log_parser.py 的 _extract_source_bill_no 实现，
+        按优先级查找 FMoBillNo / FSrcBillNo / FBillNo / WONO 等字段
+
+        Args:
+            data: 已解析的 request JSON 字典
+
+        Returns:
+            WONO 字符串，找不到返回 None
+        """
+        possible_keys = ['FMoBillNo', 'FSrcBillNo', 'FBillNo', 'WONO', 'BillNo', 'schb_number']
+
+        # 如果有 _parsed_data 嵌套，优先从那里找
+        search_data = data.get('_parsed_data', data)
+
+        # 根层级查找
+        for key in possible_keys:
+            val = search_data.get(key)
+            if val:
+                return str(val)
+
+        # data 字段可能是嵌套 JSON 字符串
+        if 'data' in data:
+            try:
+                inner = json.loads(data['data']) if isinstance(data['data'], str) else data['data']
+                for key in possible_keys:
+                    val = inner.get(key)
+                    if val:
+                        return str(val)
+            except Exception:
+                pass
+
+        # Model 层
+        model = search_data.get('Model')
+        if isinstance(model, dict):
+            for key in possible_keys:
+                val = model.get(key)
+                if val:
+                    return str(val)
+
         return None
 
     def _extract_schb(self, data: dict) -> Optional[str]:
@@ -381,6 +466,10 @@ def main():
             all_records = []
             total_lines = 0
 
+            # BUG-022 修复：parser 实例移到文件循环外，所有归档文件共享同一解析状态，
+            # 避免跨文件边界时 trigger 丢失（trigger 在上一个文件末尾，response 在下一个文件开头）
+            log_parser = FixedLogParser()
+
             for file_path, is_gz in files_to_read:
                 if is_gz:
                     content = ssh.read_gz_file(file_path)
@@ -395,26 +484,17 @@ def main():
                 total_lines += len(lines)
                 logger.info(f"  {file_path}: 读取 {len(lines)} 行")
 
-                log_parser = FixedLogParser()
-
                 for line in lines:
                     if not line.strip():
                         continue
 
-                    # 检查日期范围
-                    ts_match = re.search(r'\[(\d{4}-\d{2}-\d{2})\s+\d{2}:\d{2}:\d{2}', line)
-                    if ts_match:
-                        try:
-                            log_date = datetime.strptime(ts_match.group(1), '%Y-%m-%d')
-                            if not (start_date <= log_date <= end_date):
-                                continue
-                        except:
-                            pass
-
+                    # BUG-019 修复：移除行级别的日期过滤（会导致 trigger 行不入队但 response 仍配对）
+                    # 所有行都传给 parser（trigger 无条件入队），只对最终 record 的 report_time 过滤
                     record = log_parser.parse_line(line)
                     if record and record.is_success:
-                        all_records.append(record)
-                        stats['parsed'] += 1
+                        if start_date <= record.report_time <= end_date + timedelta(days=1):
+                            all_records.append(record)
+                            stats['parsed'] += 1
 
             stats['total'] += total_lines
             records = all_records
