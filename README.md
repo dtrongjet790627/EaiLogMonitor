@@ -1,382 +1,121 @@
 # EAI日志监听服务
 
-> 本服务是[工单小管家](https://github.com/dtrongjet790627/WorkOrderHelper)的配套工具，负责实时监听EAI接口日志并将报工成功记录同步至ACC数据库，为工单小管家提供数据支撑。
-
-## 功能说明
-
-自动监听EAI服务器上的MES报工日志，解析报工成功记录并插入ACC数据库。
-
-### 核心功能
-
-1. **SSH日志监听**：通过SSH连接EAI服务器，使用`tail -F`实时监听日志
-2. **智能解析**：解析kingdee request/response配对，提取报工成功记录
-3. **自动去重**：按工单号(SCHB_NUMBER)去重，避免重复插入
-4. **多产线支持**：同时监听多个产线日志，分别插入对应数据库
-
-### 日志与数据库映射
-
-| 日志文件 | 产线 | 数据库Schema |
-|---------|------|-------------|
-| FLOW_SMT/SMT-Line1MES报工接口.log | SMT Line1 | iplant_dpepp1 |
-| FLOW_SMT/MID-Line2MES报工接口.log | SMT Line2 | iplant_smt2 |
-| FLOW_DP-EPS/IPA MES报工接口.log | DP-EPS IPA | iplant_dpeps1 |
+> 本服务是[工单小管家](https://github.com/dtrongjet790627/WorkOrderHelper)的配套工具，负责实时监听EAI接口日志并将报工记录同步至ACC数据库。
 
 ---
 
-## 目录结构
+## 目录结构与文件规范
 
 ```
 eai_log_monitor/
-├── config.py           # 配置文件
-├── eai_log_monitor.py  # 主程序
-├── db_handler.py       # 数据库操作
-├── log_parser.py       # 日志解析
-├── requirements.txt    # Python依赖
-├── start.bat           # Windows启动脚本
-├── start.sh            # Linux启动脚本
-├── backfill_fixed.py   # 历史数据补录脚本（支持.gz归档，含--schema过滤）
-├── verify_backfill.py  # 补录结果验证脚本
-└── README.md           # 本文档
+│
+├── 【核心服务文件】（禁止随意修改，修改前必须停服备份）
+│   ├── eai_log_monitor.py      主程序：SSH监听 + 数据处理循环
+│   ├── log_parser.py           日志解析：正则提取报工字段
+│   ├── db_handler.py           数据库层：Oracle写入/去重
+│   ├── config.py               配置：SSH/DB连接信息
+│   └── backfill_fixed.py       补录工具：历史数据批量导入
+│
+├── requirements.txt            Python依赖
+├── README.md                   本文档
+├── .gitignore                  忽略 *.log __pycache__ 等
+│
+├── docs/                       文档目录
+│   └── 操作规范.md             服务运维手册（服务信息/排查/规范）
+│
+├── scripts/                    运维脚本目录
+│   ├── deploy.ps1              部署脚本（停服→复制→启服）
+│   └── install_service.bat     Windows服务注册（首次部署用）
+│
+├── tools/                      调试工具目录（生产环境不部署）
+│   ├── test_connections.py     测试SSH/Oracle连接
+│   └── verify_backfill.py      验证补录结果
+│
+└── archive/                    历史归档（只读，禁止执行）
+    ├── README.md               归档说明
+    ├── backfill_eai_logs.py    旧补录脚本（已废弃）
+    ├── fix_*_20260302.py       2026-03-02一次性修复脚本
+    ├── DEPLOY_*.md / .txt      过时部署文档
+    └── start*.bat / start.sh   旧启动脚本
 ```
+
+### 目录使用规范
+
+| 目录 | 用途 | 规范 |
+|------|------|------|
+| 根目录 | 服务运行必需文件 | 只放核心服务文件，不得随意新增 |
+| `docs/` | 文档 | 操作规范、设计说明等 |
+| `scripts/` | 可执行运维脚本 | 仅放部署/安装类脚本 |
+| `tools/` | 调试工具 | 开发排查用，不部署到生产 |
+| `archive/` | 历史归档 | 只读，不可修改，不可执行 |
+
+> **禁止在根目录创建临时脚本**（如 `fix_xxx.py`、`test_xxx.py`）。临时脚本执行完毕后移入 `archive/`；调试工具放入 `tools/`。
 
 ---
 
-## 环境要求
+## 功能说明
 
-- Python 3.8+
-- Oracle Instant Client (用于cx_Oracle)
-- 网络访问EAI服务器(172.17.10.163:2200)
-- 网络访问ACC数据库(172.17.10.165:1521)
+通过SSH连接EAI服务器，`tail -F` 实时监听多条产线日志，解析报工请求/响应对，将结果写入ACC Oracle数据库。
 
----
+### 产线与数据库映射
 
-## 本地测试
-
-### 1. 安装依赖
-
-```bash
-cd D:\TechTeam\Delivery\ACC运维\eai_log_monitor
-pip install -r requirements.txt
-```
-
-### 2. 安装Oracle Instant Client
-
-1. 下载 Oracle Instant Client: https://www.oracle.com/database/technologies/instant-client.html
-2. 解压到如 `C:\oracle\instantclient_21_9`
-3. 添加到系统PATH环境变量
-
-### 3. 启动服务
-
-**方式一：双击启动**
-```
-双击 start.bat
-```
-
-**方式二：命令行启动**
-```bash
-set EAI_MONITOR_ENV=local
-python eai_log_monitor.py
-```
-
-### 4. 查看日志
-
-日志输出到控制台和 `eai_monitor.log` 文件。
+| 日志文件（EAI 163服务器） | 产线 | Schema（165数据库） |
+|--------------------------|------|-------------------|
+| `FLOW_SMT/SMT-Line1MES报工接口.log` | SMT Line1 | iplant_dpepp1 |
+| `FLOW_SMT/MID-Line2MES报工接口.log` | SMT Line2 | iplant_smt2 |
+| `FLOW_DP-EPS/IPA MES报工接口.log` | DP-EPS IPA | iplant_dpeps1 |
 
 ---
 
-## 生产环境部署 (165服务器)
+## 快速操作
 
-### 1. 上传文件
-
-```bash
-# 在本地执行，上传整个目录到165服务器
-scp -r D:\TechTeam\Delivery\ACC运维\eai_log_monitor root@172.17.10.165:/opt/
+### 查看服务状态
+```powershell
+ssh Administrator@172.17.10.165 "sc query DT.TechTeam_EAI_Log_Monitor"
 ```
 
-### 2. 安装依赖
-
-```bash
-# SSH登录165服务器
-ssh root@172.17.10.165
-
-# 进入目录
-cd /opt/eai_log_monitor
-
-# 安装依赖
-chmod +x start.sh
-./start.sh install
+### 重启服务
+```powershell
+ssh Administrator@172.17.10.165 "sc stop DT.TechTeam_EAI_Log_Monitor"
+ssh Administrator@172.17.10.165 "sc start DT.TechTeam_EAI_Log_Monitor"
 ```
 
-### 3. 安装Oracle Instant Client (如未安装)
-
-```bash
-# CentOS/RHEL
-yum install oracle-instantclient-basic
-
-# 或手动安装
-# 下载并解压instantclient到 /opt/oracle/instantclient_21_9
-# 设置环境变量
-echo 'export LD_LIBRARY_PATH=/opt/oracle/instantclient_21_9:$LD_LIBRARY_PATH' >> ~/.bashrc
-source ~/.bashrc
+### 部署更新
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1
 ```
 
-### 4. 修改配置
-
-编辑 `config.py`，确认以下配置正确：
-
-```python
-# EAI服务器配置
-EAI_SERVER = {
-    'host': '172.17.10.163',
-    'port': 2200,
-    'user': 'root',
-    'password': 'Hangqu123',
-    'log_dir': '/usr/local/eai-apps/logs/'
-}
-
-# ACC数据库配置
-ACC_DATABASE = {
-    'host': '172.17.10.165',
-    'port': 1521,
-    'service': 'orcl.ecdag.com',
-    ...
-}
+### 查看运行日志
+```powershell
+ssh Administrator@172.17.10.165 "powershell Get-Content D:\CustomApps\eai_log_monitor\eai_monitor.log -Tail 50"
 ```
-
-### 5. 启动服务
-
-```bash
-# 后台启动
-./start.sh start
-
-# 查看状态
-./start.sh status
-
-# 查看日志
-./start.sh logs
-```
-
----
-
-## 服务管理命令
-
-### Linux (start.sh)
-
-| 命令 | 说明 |
-|------|------|
-| `./start.sh start` | 后台启动服务 |
-| `./start.sh stop` | 停止服务 |
-| `./start.sh restart` | 重启服务 |
-| `./start.sh status` | 查看服务状态 |
-| `./start.sh logs` | 实时查看日志 |
-| `./start.sh logs-recent` | 查看最近100条日志 |
-| `./start.sh run` | 前台运行（调试用） |
-| `./start.sh install` | 安装依赖包 |
-
-### Windows (start.bat)
-
-直接双击运行，按 `Ctrl+C` 停止。
 
 ---
 
 ## 历史数据补录
 
-当实时监听服务因异常中断（如数据库连接池耗尽 ORA-12516）导致数据丢失时，可使用 `backfill_fixed.py` 从EAI服务器的日志归档（`.log.gz`）中补录历史数据。
-
-### 用法
-
 ```bash
-# 补录指定日期范围（仅解析，不插入）
-python backfill_fixed.py --start-date 2026-01-01 --end-date 2026-02-28 --dry-run
+# 仅解析预览（不写入）
+python backfill_fixed.py --start-date 2026-01-01 --dry-run
 
-# 补录指定 schema（dpepp1 / smt2 / dpeps1）
+# 补录指定schema
 python backfill_fixed.py --start-date 2026-01-01 --schema smt2
 
-# 补录所有 schema
+# 补录全部
 python backfill_fixed.py --start-date 2026-01-01
 ```
 
-### 功能特性
-
-- 自动枚举 `/var/eai/logs/` 下所有 `.log.gz` 归档文件
-- 使用 `zcat` 解压读取，无需本地存储归档
-- 触发器↔响应配对解析，提取报工成功记录
-- 按 `SCHB_NUMBER` 自动去重，避免重复插入
-- 支持 `--dry-run` 模式，仅解析不写入，安全预览
-
 ---
 
-## 配置说明
+## 环境信息
 
-### 环境变量
+| 项目 | 内容 |
+|------|------|
+| 服务服务器 | 172.17.10.165 |
+| 服务路径 | `D:\CustomApps\eai_log_monitor\` |
+| 服务名 | `DT.TechTeam_EAI_Log_Monitor` |
+| EAI日志服务器 | 172.17.10.163:2200 |
+| 数据库 | 172.17.10.165:1521/orcl.ecdag.com |
+| Python | `C:\Users\Administrator\AppData\Local\Programs\Python\Python310\python.exe` |
 
-| 变量 | 说明 | 默认值 |
-|------|------|-------|
-| EAI_MONITOR_ENV | 运行环境 | local |
-
-### config.py 配置项
-
-```python
-# 服务配置
-SERVICE_CONFIG = {
-    'log_retention_days': 30,       # 日志保留天数
-    'reconnect_interval': 10,       # SSH重连间隔(秒)
-    'heartbeat_interval': 60,       # 心跳间隔(秒)
-    'batch_insert_size': 10,        # 批量插入阈值
-    'batch_insert_timeout': 5,      # 批量插入超时(秒)
-    'log_level': 'INFO'             # 日志级别
-}
-```
-
----
-
-## 数据库表结构
-
-服务会自动创建表 `ACC_ERP_REPORT_SUCCESS`：
-
-```sql
-CREATE TABLE ACC_ERP_REPORT_SUCCESS (
-    ID NUMBER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-    SCHB_NUMBER VARCHAR2(100) NOT NULL,      -- 工单号(唯一)
-    QTY NUMBER(18,4),                         -- 报工数量
-    PRODUCT_CODE VARCHAR2(100),               -- 产品编码
-    PROCESS_CODE VARCHAR2(100),               -- 工序编码
-    REPORT_TIME DATE,                         -- 报工时间
-    WORKER_CODE VARCHAR2(100),                -- 报工人员
-    RAW_REQUEST CLOB,                         -- 原始请求JSON
-    RAW_RESPONSE CLOB,                        -- 原始响应JSON
-    CREATE_TIME DATE DEFAULT SYSDATE,         -- 创建时间
-    CONSTRAINT UK_SCHB_NUMBER UNIQUE (SCHB_NUMBER)
-);
-```
-
----
-
-## 日志查看
-
-### 查看实时日志
-
-```bash
-# Linux
-tail -f eai_monitor.log
-
-# Windows
-Get-Content eai_monitor.log -Wait
-```
-
-### 日志格式
-
-```
-2026-01-11 10:30:45 [INFO] __main__: 启动监听: SMT Line1 (FLOW_SMT/SMT-Line1MES报工接口.log)
-2026-01-11 10:30:46 [INFO] db_handler: 数据库连接池创建成功: dpepp1
-2026-01-11 10:30:50 [INFO] log_parser: 解析到报工成功记录: SCHB202601110001
-2026-01-11 10:30:50 [INFO] db_handler: 插入成功: SCHB202601110001
-```
-
----
-
-## 常见问题排查
-
-### 1. SSH连接失败
-
-**现象**：日志显示 "SSH连接失败"
-
-**排查步骤**：
-```bash
-# 测试网络连通性
-ping 172.17.10.163
-
-# 测试SSH端口
-telnet 172.17.10.163 2200
-
-# 手动SSH测试
-ssh -p 2200 root@172.17.10.163
-```
-
-**解决方案**：
-- 检查防火墙规则
-- 确认SSH服务正常运行
-- 核实用户名密码
-
-### 2. 数据库连接失败
-
-**现象**：日志显示 "数据库连接失败"
-
-**排查步骤**：
-```bash
-# 测试网络连通性
-ping 172.17.10.165
-
-# 测试Oracle端口
-telnet 172.17.10.165 1521
-
-# 使用sqlplus测试
-sqlplus iplant_dpepp1/acc@172.17.10.165:1521/orcl.ecdag.com
-```
-
-**解决方案**：
-- 检查Oracle Instant Client是否正确安装
-- 确认LD_LIBRARY_PATH配置正确
-- 核实数据库用户名密码
-
-### 3. 没有解析到记录
-
-**现象**：服务正常运行，但没有插入任何记录
-
-**排查步骤**：
-1. 检查日志文件是否存在且有新数据
-```bash
-ssh -p 2200 root@172.17.10.163
-tail -f /usr/local/eai-apps/logs/FLOW_SMT/SMT-Line1MES报工接口.log
-```
-
-2. 确认日志格式是否符合预期
-3. 检查是否有报工成功记录（IsSuccess:true）
-
-### 4. 重复记录警告
-
-**现象**：日志显示大量 "工单号重复，跳过"
-
-**说明**：这是正常行为，表示去重机制生效。
-
-### 5. 内存占用过高
-
-**解决方案**：
-- 减少批量插入阈值
-- 定期重启服务
-- 检查是否有异常大的日志行
-
----
-
-## 监控建议
-
-### 进程监控
-
-```bash
-# 添加到crontab，每5分钟检查一次
-*/5 * * * * /opt/eai_log_monitor/start.sh status || /opt/eai_log_monitor/start.sh start
-```
-
-### 日志轮转
-
-创建 `/etc/logrotate.d/eai_log_monitor`：
-
-```
-/opt/eai_log_monitor/eai_monitor.log {
-    daily
-    rotate 30
-    compress
-    missingok
-    notifempty
-    copytruncate
-}
-```
-
----
-
-## 开发者信息
-
-- 开发：韩大师 (ACC运维专家) / 程远 (技术主管)
-- 日期：2026-01-11
-- 版本：1.1.0
-- 最后更新：2026-03-03（新增历史补录脚本、修复PARTNO正则截断bug、修复LINE字段时序bug）
+详细操作规范见 [docs/操作规范.md](docs/操作规范.md)。
